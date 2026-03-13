@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Crypt;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 class QuickBooksReportController extends Controller
 {
@@ -479,6 +480,13 @@ public function fetchProfitAndLossDetailall(Request $request)
     $realmId     = Crypt::decryptString($token->realm_id);
     $accessToken = $token->access_token;
 
+    $runKey = 'qbo:pldetail:running:' . md5($realmId . '|' . $startDate . '|' . $endDate . '|' . $chunkDays);
+    if (!Cache::add($runKey, now()->toDateTimeString(), now()->addMinutes(20))) {
+        return response()->json([
+            'error' => 'A matching Profit and Loss export is already running. Please wait for it to finish.'
+        ], 429);
+    }
+
     if (Carbon::now()->greaterThan($token->expires_at)) {
         Log::warning("QuickBooks token expired. Attempting to refresh...");
         if (!$this->refreshToken()) {
@@ -496,69 +504,83 @@ public function fetchProfitAndLossDetailall(Request $request)
     $chunks = $this->generateDateChunks($startDate, $endDate, $chunkDays);
     Log::info("Processing " . count($chunks) . " chunks of {$chunkDays} days each.");
 
-    $allFlattenedRows = [];
-    $headerTitles     = [];
-    $columnCount      = 0;
-
-    foreach ($chunks as $chunk) {
-        Log::info("Fetching chunk: " . $chunk['start_date'] . " -> " . $chunk['end_date']);
-        $chunkStart = microtime(true);
-
-        $reportJsonData = $this->fetchChunkWithRetry($urlBase, $accessToken, $chunk, $chunkDays);
-
-        if ($reportJsonData === null) {
-            return response()->json([
-                'error'   => 'Failed to fetch P&L Detail for chunk ' . $chunk['start_date'] . ' to ' . $chunk['end_date'],
-                'details' => 'Chunk failed after retry with smaller date range. Check logs for details.',
-            ], 400);
-        }
-
-        // Grab column headers once
-        if (empty($headerTitles)) {
-            $columns     = $reportJsonData['Columns']['Column'] ?? [];
-            $columnCount = count($columns);
-            $headerTitles = array_map(fn($col) => $col['ColTitle'] ?? '', $columns);
-            Log::info("Extracted column headers: " . implode(', ', $headerTitles));
-        }
-
-        // Flatten rows for this chunk
-        if (isset($reportJsonData['Rows']['Row'])) {
-            $flattened = [];
-            $this->flattenAllRows($reportJsonData['Rows']['Row'], $flattened, $columnCount);
-
-            foreach ($flattened as &$flatRow) {
-                foreach ($flatRow as &$field) {
-                    $field = str_replace(["\r", "\n"], ' ', $field);
-                }
-            }
-            unset($flatRow, $field);
-
-            $allFlattenedRows = array_merge($allFlattenedRows, $flattened);
-            Log::info("Processed " . count($flattened) . " rows for chunk " . $chunk['start_date'] . " -> " . $chunk['end_date']);
-        } else {
-            Log::warning("No rows returned for chunk: " . $chunk['start_date'] . " -> " . $chunk['end_date']);
-        }
-
-        $elapsed = round(microtime(true) - $chunkStart, 2);
-        Log::info("Chunk took {$elapsed}s.");
-        $this->paceQuickBooksCalls($requestGapMs);
-    }
-
-    Log::info("Total rows collected: " . count($allFlattenedRows));
-
     $filename   = "Profit_and_Loss_AllData.csv";
     $csvHeaders = [
         'Content-Type'        => 'text/csv',
         'Content-Disposition' => "attachment; filename=\"{$filename}\"",
+        'X-Accel-Buffering'   => 'no',
+        'Cache-Control'       => 'no-cache, no-store, must-revalidate',
+        'Pragma'              => 'no-cache',
     ];
 
-    return response()->stream(function () use ($headerTitles, $allFlattenedRows) {
+    return response()->stream(function () use ($urlBase, $accessToken, $chunks, $chunkDays, $requestGapMs, $runKey) {
         $file = fopen('php://output', 'w');
-        fputcsv($file, $headerTitles);
-        foreach ($allFlattenedRows as $row) {
-            fputcsv($file, $row);
+
+        $headerWritten = false;
+        $columnCount = 0;
+        $totalRows = 0;
+
+        try {
+            foreach ($chunks as $chunk) {
+                Log::info("Fetching chunk: " . $chunk['start_date'] . " -> " . $chunk['end_date']);
+                $chunkStart = microtime(true);
+
+                $reportJsonData = $this->fetchChunkWithRetry($urlBase, $accessToken, $chunk, $chunkDays);
+
+                if ($reportJsonData === null) {
+                    Log::error('Aborting CSV stream due to failed chunk fetch.', [
+                        'chunk_start' => $chunk['start_date'],
+                        'chunk_end' => $chunk['end_date'],
+                    ]);
+                    break;
+                }
+
+                if (!$headerWritten) {
+                    $columns     = $reportJsonData['Columns']['Column'] ?? [];
+                    $columnCount = count($columns);
+                    $headerTitles = array_map(fn($col) => $col['ColTitle'] ?? '', $columns);
+                    fputcsv($file, $headerTitles);
+                    $headerWritten = true;
+                    Log::info("Extracted column headers: " . implode(', ', $headerTitles));
+                }
+
+                if (isset($reportJsonData['Rows']['Row'])) {
+                    $flattened = [];
+                    $this->flattenAllRows($reportJsonData['Rows']['Row'], $flattened, $columnCount);
+
+                    foreach ($flattened as $row) {
+                        foreach ($row as &$field) {
+                            if (is_string($field)) {
+                                $field = str_replace(["\r", "\n"], ' ', $field);
+                            }
+                        }
+                        unset($field);
+                        fputcsv($file, $row);
+                    }
+
+                    $totalRows += count($flattened);
+                    Log::info("Processed " . count($flattened) . " rows for chunk " . $chunk['start_date'] . " -> " . $chunk['end_date']);
+                } else {
+                    Log::warning("No rows returned for chunk: " . $chunk['start_date'] . " -> " . $chunk['end_date']);
+                }
+
+                $elapsed = round(microtime(true) - $chunkStart, 2);
+                Log::info("Chunk took {$elapsed}s.");
+
+                fflush($file);
+                if (function_exists('ob_flush')) {
+                    @ob_flush();
+                }
+                flush();
+
+                $this->paceQuickBooksCalls($requestGapMs);
+            }
+
+            Log::info("Total rows collected: " . $totalRows);
+        } finally {
+            fclose($file);
+            Cache::forget($runKey);
         }
-        fclose($file);
     }, 200, $csvHeaders);
 }
 
