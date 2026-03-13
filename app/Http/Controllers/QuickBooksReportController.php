@@ -463,9 +463,10 @@ public function fetchProfitAndLossDetailall(Request $request)
     // Accept dynamic date range and chunk size, with safe defaults
     $startDate = $request->query('start_date', '2023-01-01');
     $endDate   = $request->query('end_date', Carbon::now()->toDateString());
-    $chunkDays = max(7, min(90, (int) $request->query('chunk_days', 30)));
+    $chunkDays = max(7, min(90, (int) $request->query('chunk_days', 14)));
+    $requestGapMs = max(150, min(3000, (int) $request->query('request_gap_ms', 300)));
 
-    Log::info("Parameters: start={$startDate}, end={$endDate}, chunk_days={$chunkDays}");
+    Log::info("Parameters: start={$startDate}, end={$endDate}, chunk_days={$chunkDays}, request_gap_ms={$requestGapMs}");
 
     // 1) Verify or refresh your QuickBooks token
     $token = QuickBooksToken::first();
@@ -540,6 +541,7 @@ public function fetchProfitAndLossDetailall(Request $request)
 
         $elapsed = round(microtime(true) - $chunkStart, 2);
         Log::info("Chunk took {$elapsed}s.");
+        $this->paceQuickBooksCalls($requestGapMs);
     }
 
     Log::info("Total rows collected: " . count($allFlattenedRows));
@@ -770,19 +772,121 @@ private function padLevels(array $levels, int $n): array
 }
 
 /**
+ * Adds a small delay between QuickBooks calls to avoid per-second burst limits.
+ */
+private function paceQuickBooksCalls(int $delayMs = 300): void
+{
+    usleep(max(0, $delayMs) * 1000);
+}
+
+/**
+ * Performs a resilient GET to QuickBooks with backoff for throttling and transient failures.
+ */
+private function qboGetWithBackoff(string $url, string $accessToken, array $queryParams, int $maxAttempts = 6): ?\Illuminate\Http\Client\Response
+{
+    for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        try {
+            $response = Http::withHeaders([
+                'Authorization' => 'Bearer ' . $accessToken,
+                'Accept'        => 'application/json',
+            ])->withOptions([
+                'http_errors' => false,
+                'version' => 1.1,
+                'connect_timeout' => 20,
+                'timeout' => 180,
+            ])->get($url, $queryParams);
+        } catch (\Throwable $e) {
+            if ($attempt === $maxAttempts) {
+                Log::error('QBO request failed after max attempts due to transport error.', [
+                    'attempts' => $maxAttempts,
+                    'message' => $e->getMessage(),
+                    'url' => $url,
+                    'query' => $queryParams,
+                ]);
+                return null;
+            }
+
+            $delayMs = $this->calculateBackoffDelayMs($attempt);
+            Log::warning('Transient transport error calling QBO; retrying.', [
+                'attempt' => $attempt,
+                'max_attempts' => $maxAttempts,
+                'delay_ms' => $delayMs,
+                'message' => $e->getMessage(),
+            ]);
+            $this->paceQuickBooksCalls($delayMs);
+            continue;
+        }
+
+        if ($response->successful()) {
+            return $response;
+        }
+
+        $status = $response->status();
+        $retryable = in_array($status, [429, 500, 502, 503, 504], true);
+
+        if (!$retryable || $attempt === $maxAttempts) {
+            return $response;
+        }
+
+        $retryAfterSeconds = $this->parseRetryAfterSeconds($response->header('Retry-After'));
+        $delayMs = $retryAfterSeconds !== null
+            ? max(1000, $retryAfterSeconds * 1000)
+            : $this->calculateBackoffDelayMs($attempt);
+
+        Log::warning('QBO returned retryable status; backing off.', [
+            'attempt' => $attempt,
+            'max_attempts' => $maxAttempts,
+            'status' => $status,
+            'delay_ms' => $delayMs,
+            'intuit_tid' => $response->header('intuit_tid'),
+        ]);
+
+        $this->paceQuickBooksCalls($delayMs);
+    }
+
+    return null;
+}
+
+private function calculateBackoffDelayMs(int $attempt): int
+{
+    $base = min(15000, 500 * (2 ** max(0, $attempt - 1)));
+    $jitter = random_int(100, 600);
+    return (int) ($base + $jitter);
+}
+
+private function parseRetryAfterSeconds($retryAfterHeader): ?int
+{
+    if (empty($retryAfterHeader)) {
+        return null;
+    }
+
+    if (is_numeric($retryAfterHeader)) {
+        return max(0, (int) $retryAfterHeader);
+    }
+
+    try {
+        $retryAt = Carbon::parse($retryAfterHeader);
+        return max(0, Carbon::now()->diffInSeconds($retryAt, false));
+    } catch (\Throwable $e) {
+        return null;
+    }
+}
+
+/**
  * Fetches a single P&L chunk from the QBO API.
  * On failure, splits the chunk in half and retries each sub-chunk after a 2-second pause.
  * Returns the merged report JSON on success, or null if all retries fail.
  */
 private function fetchChunkWithRetry(string $url, string $accessToken, array $chunk, int $chunkDays): ?array
 {
-    $response = Http::withHeaders([
-        'Authorization' => 'Bearer ' . $accessToken,
-        'Accept'        => 'application/json',
-    ])->get($url, [
+    $response = $this->qboGetWithBackoff($url, $accessToken, [
         'start_date' => $chunk['start_date'],
         'end_date'   => $chunk['end_date'],
     ]);
+
+    if ($response === null) {
+        return null;
+    }
 
     if ($response->successful()) {
         return $response->json();
@@ -799,15 +903,19 @@ private function fetchChunkWithRetry(string $url, string $accessToken, array $ch
     $mergedData = null;
 
     foreach ($subChunks as $sub) {
-        sleep(2);
+        $this->paceQuickBooksCalls(1200);
 
-        $subResponse = Http::withHeaders([
-            'Authorization' => 'Bearer ' . $accessToken,
-            'Accept'        => 'application/json',
-        ])->get($url, [
+        $subResponse = $this->qboGetWithBackoff($url, $accessToken, [
             'start_date' => $sub['start_date'],
             'end_date'   => $sub['end_date'],
         ]);
+
+        if ($subResponse === null) {
+            Log::error(
+                "Sub-chunk {$sub['start_date']} - {$sub['end_date']} failed due to transport-level failure after retries."
+            );
+            return null;
+        }
 
         if ($subResponse->failed()) {
             Log::error(
